@@ -2,14 +2,17 @@
 pragma solidity ^0.8.17;
 
 /// @title SELVA Traceability - Copaiba oil-resin traceability MVP
-/// @author SELVA
-/// @notice MVP smart contract implementing registration, producer promotion,
-///         product (lot) registration and ownership transfer, plus basic history.
-/// @dev Simple, well commented implementation following the supplementary material.
+/// @author SELVA Research Team - Federal University of Amazonas (UFAM)
+/// @notice MVP smart contract for blockchain-based traceability of Amazonian copaiba supply chains
+/// @dev Optimized implementation with reduced gas consumption
+/// @custom:version 2.0.0 - Gas optimized, bug fixes applied
 contract SELVATraceability {
 
-    // ---------- Ownership / Roles ----------
-    address public owner; // contract owner (deployer) - has administrative privileges
+    // ══════════════════════════════════════════════════════════════
+    // OWNERSHIP & ACCESS CONTROL
+    // ══════════════════════════════════════════════════════════════
+    
+    address public immutable owner; // Contract deployer (immutable saves gas)
 
     constructor() {
         owner = msg.sender;
@@ -20,76 +23,231 @@ contract SELVATraceability {
         _;
     }
 
-    modifier onlyRegistered(bytes32 userHash) {
-        require(users[userHash].createdAt != 0, "User not registered");
+    modifier onlyProducer() {
+        require(isProducer[msg.sender], "Only producers can perform this action");
         _;
     }
 
-    // ---------- Events (for off-chain forensic / UI) ----------
-    event UserRegistered(bytes32 indexed userHash, address userAddress);
-    event ProducerCreated(address indexed producerAddress);
-    event ProductAdded(string indexed lotId, address indexed producer, bytes32 documentHash);
-    event OwnershipTransferred(string indexed lotId, address indexed from, address indexed to);
+    // ══════════════════════════════════════════════════════════════
+    // EVENTS (for off-chain indexing and forensic analysis)
+    // ══════════════════════════════════════════════════════════════
+    
+    event UserRegistered(bytes32 indexed userHash, address indexed userAddress, string name);
+    event ProducerCreated(address indexed producerAddress, bytes32 indexed userHash);
+    event ProductAdded(string indexed lotId, address indexed producer, uint256 volume, bytes32 documentHash);
+    event OwnershipTransferred(string indexed lotId, address indexed from, address indexed to, uint256 timestamp);
+    event ProductDeactivated(string indexed lotId, address indexed deactivatedBy);
 
-    // ---------- User model ----------
+    // ══════════════════════════════════════════════════════════════
+    // USER MODEL
+    // ══════════════════════════════════════════════════════════════
+    
     struct User {
         string name;
         string cpf;
-        address account; // Ethereum address that registered
-        uint256 createdAt;
+        address account;
+        uint64 createdAt;  // uint64 is sufficient for timestamps (saves gas)
+        bool exists;       // Explicit flag for existence check
     }
 
-    // maps a user-hash -> User
     mapping(bytes32 => User) private users;
     bytes32[] private userIndex;
-
-    // maps address -> userHash (if registered)
     mapping(address => bytes32) private addressToUserHash;
 
-    // ---------- Producer role ----------
+    // ══════════════════════════════════════════════════════════════
+    // PRODUCER ROLE
+    // ══════════════════════════════════════════════════════════════
+    
     mapping(address => bool) public isProducer;
+    address[] private producerList; // Track all producers for enumeration
 
-    // ---------- Product / Lot model ----------
+    // ══════════════════════════════════════════════════════════════
+    // PRODUCT / LOT MODEL
+    // ══════════════════════════════════════════════════════════════
+    
     struct Product {
-        string lotId;          // unique identifier (ex: "ABC123")
-        uint256 volume;        // liters (or base units)
-        string origin;         // origin text (species + location)
-        address producer;      // original extractor (immutable)
-        address currentOwner;  // current owner
-        bytes32 documentHash;  // SHA-256 hash of license/document
-        uint256 createdAt;     // block.timestamp of registration
-        bool active;           // whether this lot is active (registered)
+        string lotId;
+        uint128 volume;        // uint128 saves gas, more than enough for liters
+        string origin;
+        address producer;      // Original producer (immutable after creation)
+        address currentOwner;
+        bytes32 documentHash;
+        uint64 createdAt;
+        bool active;
     }
 
-    // mapping lotId -> Product
     mapping(string => Product) private products;
-
-    // keep index of lotIds for listing
     string[] private lotIndex;
 
-    // ---------- Product history entries ----------
+    // ══════════════════════════════════════════════════════════════
+    // PRODUCT HISTORY / AUDIT TRAIL
+    // ══════════════════════════════════════════════════════════════
+    
     struct Trace {
-        address actor;      // who executed action
-        string action;      // "CREATED" | "TRANSFERRED" | "OTHER"
-        bytes32 docHash;    // optional doc hash associated with the action
-        address from;       // previous owner (if transfer)
-        address to;         // new owner (if transfer)
-        uint256 timestamp;  // block timestamp
+        address actor;
+        string action;      // "CREATED" | "TRANSFERRED" | "DEACTIVATED"
+        bytes32 docHash;
+        address from;
+        address to;
+        uint64 timestamp;
     }
 
-    // mapping lotId => array of trace events
     mapping(string => Trace[]) private history;
 
-    // ---------- Read helpers (public) ----------
+    // ══════════════════════════════════════════════════════════════
+    // USER FUNCTIONS
+    // ══════════════════════════════════════════════════════════════
+
+    /// @notice Register a new user in the system
+    /// @param _name User's full name
+    /// @param _cpf User's CPF (Brazilian tax ID)
+    /// @return userHash Unique identifier for the user
+    function registerUser(string calldata _name, string calldata _cpf) external returns (bytes32) {
+        require(bytes(_name).length > 0, "Name required");
+        require(bytes(_cpf).length > 0, "CPF required");
+        require(addressToUserHash[msg.sender] == bytes32(0), "Address already registered");
+
+        bytes32 userHash = keccak256(abi.encodePacked(_name, _cpf, block.timestamp, msg.sender));
+
+        users[userHash] = User({
+            name: _name,
+            cpf: _cpf,
+            account: msg.sender,
+            createdAt: uint64(block.timestamp),
+            exists: true
+        });
+
+        addressToUserHash[msg.sender] = userHash;
+        userIndex.push(userHash);
+
+        emit UserRegistered(userHash, msg.sender, _name);
+        return userHash;
+    }
+
+    /// @notice Promote a registered user to producer role
+    /// @dev Only contract owner can call this. The user must be registered first.
+    /// @param _userAddress Address of the user to promote
+    function makeProducer(address _userAddress) external onlyOwner {
+        require(_userAddress != address(0), "Invalid address");
+        
+        bytes32 userHash = addressToUserHash[_userAddress];
+        require(userHash != bytes32(0), "User not registered");
+        require(!isProducer[_userAddress], "Already a producer");
+
+        isProducer[_userAddress] = true;
+        producerList.push(_userAddress);
+
+        emit ProducerCreated(_userAddress, userHash);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PRODUCT FUNCTIONS
+    // ══════════════════════════════════════════════════════════════
+
+    /// @notice Register a new product (lot) on the blockchain
+    /// @dev Only producers can add products. Duplicate lotIds are rejected.
+    /// @param _lotId Unique identifier for the lot
+    /// @param _volume Volume in liters (or base units)
+    /// @param _origin Origin information (species, location, GPS)
+    /// @param _docHash SHA-256 hash of environmental license/document
+    function addProduct(
+        string calldata _lotId,
+        uint128 _volume,
+        string calldata _origin,
+        bytes32 _docHash
+    ) external onlyProducer {
+        require(bytes(_lotId).length > 0, "LotId required");
+        require(_volume > 0, "Volume must be positive");
+        require(!products[_lotId].active, "Lot already exists");
+
+        products[_lotId] = Product({
+            lotId: _lotId,
+            volume: _volume,
+            origin: _origin,
+            producer: msg.sender,
+            currentOwner: msg.sender,
+            documentHash: _docHash,
+            createdAt: uint64(block.timestamp),
+            active: true
+        });
+
+        lotIndex.push(_lotId);
+
+        // Record creation in history
+        history[_lotId].push(Trace({
+            actor: msg.sender,
+            action: "CREATED",
+            docHash: _docHash,
+            from: address(0),
+            to: msg.sender,
+            timestamp: uint64(block.timestamp)
+        }));
+
+        emit ProductAdded(_lotId, msg.sender, _volume, _docHash);
+    }
+
+    /// @notice Transfer ownership of a product to another address
+    /// @dev Only the current owner can transfer. Validates product exists and is active.
+    /// @param _lotId Lot identifier to transfer
+    /// @param _newOwner Address of the new owner
+    function transferProduct(string calldata _lotId, address _newOwner) external {
+        require(_newOwner != address(0), "Invalid recipient");
+        
+        Product storage p = products[_lotId];
+        require(p.active, "Product not found or inactive");
+        require(p.currentOwner == msg.sender, "Only owner can transfer");
+
+        address previousOwner = p.currentOwner;
+        p.currentOwner = _newOwner;
+
+        // Record transfer in history
+        history[_lotId].push(Trace({
+            actor: msg.sender,
+            action: "TRANSFERRED",
+            docHash: p.documentHash,
+            from: previousOwner,
+            to: _newOwner,
+            timestamp: uint64(block.timestamp)
+        }));
+
+        emit OwnershipTransferred(_lotId, previousOwner, _newOwner, block.timestamp);
+    }
+
+    /// @notice Deactivate a product (administrative action)
+    /// @dev Only owner can deactivate. Used for corrections or cleanup.
+    /// @param _lotId Lot identifier to deactivate
+    function deactivateProduct(string calldata _lotId) external onlyOwner {
+        Product storage p = products[_lotId];
+        require(p.createdAt != 0, "Product not found");
+        require(p.active, "Already inactive");
+        
+        p.active = false;
+
+        history[_lotId].push(Trace({
+            actor: msg.sender,
+            action: "DEACTIVATED",
+            docHash: p.documentHash,
+            from: p.currentOwner,
+            to: p.currentOwner,
+            timestamp: uint64(block.timestamp)
+        }));
+
+        emit ProductDeactivated(_lotId, msg.sender);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS (Read-only, no gas cost for external calls)
+    // ══════════════════════════════════════════════════════════════
+
     /// @notice Get product details by lotId
-    function getProduct(string memory _lotId) public view returns (
+    function getProduct(string calldata _lotId) external view returns (
         string memory lotId,
-        uint256 volume,
+        uint128 volume,
         string memory origin,
         address producer,
         address currentOwner,
         bytes32 documentHash,
-        uint256 createdAt,
+        uint64 createdAt,
         bool active
     ) {
         Product memory p = products[_lotId];
@@ -97,15 +255,14 @@ contract SELVATraceability {
         return (p.lotId, p.volume, p.origin, p.producer, p.currentOwner, p.documentHash, p.createdAt, p.active);
     }
 
-    /// @notice Get product history arrays for a lot
-    /// @dev Returns parallel arrays for easier ABI decoding off-chain
-    function getProductHistory(string memory _lotId) public view returns (
+    /// @notice Get complete history of a product
+    function getProductHistory(string calldata _lotId) external view returns (
         address[] memory actors,
         string[] memory actions,
         bytes32[] memory docHashes,
         address[] memory froms,
         address[] memory tos,
-        uint256[] memory timestamps
+        uint64[] memory timestamps
     ) {
         Trace[] memory traces = history[_lotId];
         uint256 len = traces.length;
@@ -115,7 +272,7 @@ contract SELVATraceability {
         docHashes = new bytes32[](len);
         froms = new address[](len);
         tos = new address[](len);
-        timestamps = new uint256[](len);
+        timestamps = new uint64[](len);
 
         for (uint256 i = 0; i < len; i++) {
             actors[i] = traces[i].actor;
@@ -127,152 +284,55 @@ contract SELVATraceability {
         }
     }
 
-    /// @notice List all registered lotIds
-    function listAllLotIds() public view returns (string[] memory) {
+    /// @notice List all registered lot IDs
+    function listAllLotIds() external view returns (string[] memory) {
         return lotIndex;
     }
 
-    /// @notice Check whether address is a registered user
-    function isUserRegistered(address _addr) public view returns (bool) {
-        return addressToUserHash[_addr] != bytes32(0);
+    /// @notice Get total number of products registered
+    function getProductCount() external view returns (uint256) {
+        return lotIndex.length;
     }
 
-    // ---------- Core functions (as specified in the material) ----------
-
-    /// @notice Register a user and return a userHash (bytes32)
-    /// @dev userHash is computed as keccak256(name + cpf + block.timestamp + msg.sender)
-    function registerUser(string memory _name, string memory _cpf) public returns (bytes32) {
-        require(bytes(_name).length > 0 && bytes(_cpf).length > 0, "Invalid input");
-        require(addressToUserHash[msg.sender] == bytes32(0), "Address already registered");
-
-        bytes32 userHash = keccak256(abi.encodePacked(_name, _cpf, block.timestamp, msg.sender));
-
-        users[userHash] = User({
-            name: _name,
-            cpf: _cpf,
-            account: msg.sender,
-            createdAt: block.timestamp
-        });
-
-        addressToUserHash[msg.sender] = userHash;
-
-        // Store for enumeration
-        userIndex.push(userHash);
-
-        emit UserRegistered(userHash, msg.sender);
-        return userHash;
-    }
-
-    /// @notice Returns all registered user hashes
-    function listAllUsers() public view returns (bytes32[] memory) {
+    /// @notice List all registered users
+    function listAllUsers() external view returns (bytes32[] memory) {
         return userIndex;
     }
 
-    /// @notice Promote an existing registered user (address) to producer role
-    /// @dev only contract owner can call this (administrative action)
-    function makeProducer(address _userAddress) external onlyOwner {
-        require(_userAddress != address(0), "Zero address");
-        require(addressToUserHash[_userAddress] != bytes32(0), "User not registered");
-        require(!isProducer[_userAddress], "Already producer");
-
-        isProducer[_userAddress] = true;
-
-        emit ProducerCreated(_userAddress);
+    /// @notice Get total number of registered users
+    function getUserCount() external view returns (uint256) {
+        return userIndex.length;
     }
 
-    /// @notice Register a new product (lot) on-chain
-    /// @dev Only producers may call this. Prevent duplicate lot registrations.
-    function addProduct(
-        string memory _lotId,
-        uint256 _volume,
-        string memory _origin,
-        bytes32 _docHash
-    ) external {
-        require(isProducer[msg.sender], "Only producers can add products");
-        require(bytes(_lotId).length > 0, "Missing lotId");
-        require(_volume > 0, "Volume must be > 0");
-        Product storage p = products[_lotId];
-        require(p.createdAt == 0 || p.active == false, "Product with this lot ID already exists");
-
-        products[_lotId] = Product({
-            lotId: _lotId,
-            volume: _volume,
-            origin: _origin,
-            producer: msg.sender,
-            currentOwner: msg.sender,
-            documentHash: _docHash,
-            createdAt: block.timestamp,
-            active: true
-        });
-
-        lotIndex.push(_lotId);
-
-        // add initial trace entry
-        history[_lotId].push(Trace({
-            actor: msg.sender,
-            action: "CREATED",
-            docHash: _docHash,
-            from: address(0),
-            to: msg.sender,
-            timestamp: block.timestamp
-        }));
-
-        emit ProductAdded(_lotId, msg.sender, _docHash);
-    }
-
-    /// @notice Transfer ownership of a lot to another address
-    /// @dev Only the current owner of the lot can transfer it.
-    function transferProduct(string memory _lotId, address _newOwner) external {
-        require(_newOwner != address(0), "Zero address");
-        Product storage p = products[_lotId];
-        require(p.createdAt != 0 && p.active == true, "Product not found or inactive");
-        require(p.currentOwner == msg.sender, "Only current owner can transfer this product");
-
-        address previousOwner = p.currentOwner;
-        p.currentOwner = _newOwner;
-
-        // push trace
-        history[_lotId].push(Trace({
-            actor: msg.sender,
-            action: "TRANSFERRED",
-            docHash: p.documentHash,
-            from: previousOwner,
-            to: _newOwner,
-            timestamp: block.timestamp
-        }));
-
-        emit OwnershipTransferred(_lotId, previousOwner, _newOwner);
-    }
-
-    // ---------- Administrative helpers (optional) ----------
-
-    /// @notice Deactivate a product (logical deletion) - only owner (admin)
-    /// @dev Useful for administrative corrections or test cleanup
-    function deactivateProduct(string memory _lotId) external onlyOwner {
-        Product storage p = products[_lotId];
-        require(p.createdAt != 0, "Product not found");
-        p.active = false;
-
-        // admin trace
-        history[_lotId].push(Trace({
-            actor: msg.sender,
-            action: "DEACTIVATED",
-            docHash: p.documentHash,
-            from: p.currentOwner,
-            to: p.currentOwner,
-            timestamp: block.timestamp
-        }));
-    }
-
-    /// @notice Convenience: get user by hash
-    function getUser(bytes32 _userHash) public view returns (string memory name, string memory cpf, address account, uint256 createdAt) {
+    /// @notice Get user details by hash
+    function getUser(bytes32 _userHash) external view returns (
+        string memory name,
+        string memory cpf,
+        address account,
+        uint64 createdAt
+    ) {
         User memory u = users[_userHash];
-        require(u.createdAt != 0, "User not found");
+        require(u.exists, "User not found");
         return (u.name, u.cpf, u.account, u.createdAt);
     }
 
-    /// @notice Get userHash for an address (0 if not registered)
-    function userHashOf(address _addr) public view returns (bytes32) {
+    /// @notice Check if address is a registered user
+    function isUserRegistered(address _addr) external view returns (bool) {
+        return addressToUserHash[_addr] != bytes32(0);
+    }
+
+    /// @notice Get userHash for an address
+    function userHashOf(address _addr) external view returns (bytes32) {
         return addressToUserHash[_addr];
+    }
+
+    /// @notice List all producers
+    function listAllProducers() external view returns (address[] memory) {
+        return producerList;
+    }
+
+    /// @notice Get total number of producers
+    function getProducerCount() external view returns (uint256) {
+        return producerList.length;
     }
 }
